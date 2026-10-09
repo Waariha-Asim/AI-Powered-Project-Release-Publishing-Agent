@@ -1,6 +1,6 @@
 # 🚀 AI-Powered Project Release & Publishing Agent
 
-An end-to-end n8n automation that takes raw project files, scans and sanitizes secrets, generates documentation, and publishes the project to GitHub and LinkedIn — fully autonomously.
+> An end-to-end AI-powered agent built in n8n that takes raw project files, scans and sanitizes secrets, generates documentation, and publishes the project to GitHub and LinkedIn — fully autonomously.
 
 ![Screenshot](https://raw.githubusercontent.com/Waariha-Asim/AI-Powered-Project-Release-Publishing-Agent/main/Screenshot%202026-10-09%20224619.png)
 
@@ -8,7 +8,7 @@ An end-to-end n8n automation that takes raw project files, scans and sanitizes s
 
 ## 📖 Overview
 
-This project is an **n8n workflow** that automates the entire release pipeline for a software project — from raw file upload to a published GitHub repository and a LinkedIn announcement post. It detects the project type, scans for leaked secrets using regex + AI verification, sanitizes them into environment variables, generates a README and workflow diagram, and pushes everything live after human approval.
+This project is an **AI-powered agent** built on n8n that handles the entire release pipeline for a software project — from raw file upload to a published GitHub repository and a LinkedIn announcement post. It detects the project type, scans for leaked secrets using regex + AI verification, sanitizes them into environment variables, generates a README and workflow diagram, and pushes everything live after human approval.
 
 ---
 
@@ -50,7 +50,7 @@ This project is an **n8n workflow** that automates the entire release pipeline f
 
 ```
 .
-├── workflow.json        # Main n8n automation (this file)
+├── workflow.json        # Main n8n AI-powered agent workflow (this file)
 ├── screenshot.py         # Flask microservice: launches Streamlit apps
 │                          # headlessly and captures a Selenium screenshot
 └── assets/

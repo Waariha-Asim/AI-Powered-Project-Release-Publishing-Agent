@@ -1,0 +1,759 @@
+{
+  "nodes": [
+    {
+      "parameters": {
+        "jsCode": "const d = $input.first().json;\nconst files = d.files || [];\nconst names = files.map(f => f.filename.replace(/\\\\/g, '/'));\nconst py = files.filter(f => f.extension === 'py' && !f.binary);\n\nconst has = n => names.some(x => x === n || x.endsWith('/' + n));\nconst imports = lib => {\n  const escaped = lib.replace(/\\./g, '\\\\.');\n  return py.some(f => new RegExp('(^|\\n)\\\\s*(from\\\\s+' + escaped + '|import\\\\s+' + escaped + ')', 'm').test(f.content || ''));\n};\n\nlet track = 'A';\nlet type = 'python_project';\nlet framework = 'Python';\nlet entrypoint = null;\nlet start_cmd = null;\nlet port = null;\nlet browser_runnable = false;\nlet domain = 'general_python';\n\n// Check for n8n workflow JSON first (Track B)\nconst workflowFile = files.find(f => f.filename === 'workflow.json' || f.filename.endsWith('/workflow.json'));\n\nif (workflowFile && !workflowFile.binary) {\n  try {\n    const w = JSON.parse(workflowFile.content);\n    if (Array.isArray(w.nodes) && w.connections && typeof w.connections === 'object') {\n      track = 'B';\n      type = 'n8n_workflow';\n      framework = 'n8n';\n      entrypoint = workflowFile.filename;\n    }\n  } catch {}\n}\n\n// Track A: Python project detection\nif (track === 'A') {\n  if (has('app.py') && imports('streamlit')) {\n    type = 'streamlit';\n    framework = 'Streamlit';\n    entrypoint = 'app.py';\n    start_cmd = 'streamlit run app.py --server.headless true --server.address 0.0.0.0 --server.port 8501';\n    port = 8501;\n    browser_runnable = true;\n  } else if (imports('fastapi')) {\n    type = 'fastapi';\n    framework = 'FastAPI';\n    entrypoint = has('main.py') ? 'main.py' : 'app.py';\n    start_cmd = 'uvicorn main:app --host 0.0.0.0 --port 8000';\n    port = 8000;\n    browser_runnable = true;\n  } else if (has('app.py') && imports('flask')) {\n    type = 'flask';\n    framework = 'Flask';\n    entrypoint = 'app.py';\n    start_cmd = 'python app.py';\n    port = 5000;\n    browser_runnable = true;\n  } else if (imports('gradio')) {\n    type = 'gradio';\n    framework = 'Gradio';\n    entrypoint = py.find(f => /app|main/i.test(f.filename))?.filename || py[0]?.filename;\n    start_cmd = 'python ' + (py.find(f => /app|main/i.test(f.filename))?.filename || py[0]?.filename || 'app.py');\n    port = 7860;\n    browser_runnable = true;\n  } else if (has('manage.py')) {\n    type = 'django';\n    framework = 'Django';\n    entrypoint = 'manage.py';\n    start_cmd = 'python manage.py runserver 0.0.0.0:8000';\n    port = 8000;\n    browser_runnable = true;\n  } else if (has('index.html')) {\n    type = 'static_web';\n    framework = 'HTML/CSS/JS';\n    entrypoint = 'index.html';\n    start_cmd = 'python -m http.server 8000 --bind 0.0.0.0';\n    port = 8000;\n    browser_runnable = true;\n  }\n\n  // Domain detection: orthogonal to runtime\n  if (imports('langchain') || imports('langgraph') || imports('qdrant_client') || imports('chromadb') || imports('faiss')) {\n    domain = 'rag_or_agent';\n  } else if (imports('openai') || imports('anthropic') || imports('google.generativeai')) {\n    domain = 'llm_application';\n  }\n}\n\nreturn {\n  ...d,\n  detection: {\n    track,\n    type,\n    framework,\n    domain,\n    entrypoint,\n    start_cmd,\n    port,\n    browser_runnable\n  }\n};"
+      },
+      "id": "1143407f-bd48-4233-884e-6f780864ec22",
+      "name": "Project Detection1",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-4704, -2992]
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $input.first().json;\nconst candidates = [];\n\n// FIX: .env files ARE scanned here — they are excluded from publishing later,\n// not before scanning. This ensures we harvest real secret variable names.\n\nconst patterns = [\n  { name: 'Google API Key',      regex: /AIza[A-Za-z0-9_-]{35}/g },\n  { name: 'GitHub Token',        regex: /(?:ghp|gho|github_pat)_[A-Za-z0-9_]{20,}/g },\n  { name: 'OpenAI Key',          regex: /sk-[A-Za-z0-9]{32,}/g },\n  { name: 'Anthropic Key',       regex: /sk-ant-[A-Za-z0-9_-]{32,}/g },\n  { name: 'HuggingFace Token',   regex: /hf_[A-Za-z0-9]{32,}/g },\n  { name: 'AWS Access Key',      regex: /AKIA[A-Z0-9]{16}/g },\n  { name: 'Bearer Token',        regex: /Bearer\\s+[A-Za-z0-9_.=-]{20,}/gi },\n  { name: 'Database URL',        regex: /(?:postgres(?:ql)?|mongodb(?:\\+srv)?|mysql|redis):\\/\\/[^\\s]+:[^\\s]+@/gi },\n  { name: 'API Key Assignment',  regex: /(?:api[_-]?key|apikey)\\s*[=:]\\s*['\"][^'\"]{12,}['\"]/gi },\n  { name: 'Secret Assignment',   regex: /(?:secret[_-]?key|client[_-]?secret)\\s*[=:]\\s*['\"][^'\"]{12,}['\"]/gi },\n  { name: 'Password Assignment', regex: /(?:password|passwd|pwd)\\s*[=:]\\s*['\"][^'\"]{8,}['\"]/gi }\n];\n\nfor (const file of d.files || []) {\n  if (file.binary || !file.content || file.content === '[binary file]') continue;\n\n  const lines = file.content.split('\\n');\n\n  for (const pattern of patterns) {\n    // Always create a fresh regex to reset lastIndex\n    const regex = new RegExp(pattern.regex.source, pattern.regex.flags);\n    let match;\n\n    while ((match = regex.exec(file.content)) !== null) {\n      const lineNum = (file.content.slice(0, match.index).match(/\\n/g) || []).length + 1;\n\n      candidates.push({\n        index: candidates.length,  // stable global index — Gemini references this\n        file: file.filename,\n        line: lineNum,\n        type: pattern.name,\n        match: match[0].slice(0, 150),\n        line_content: (lines[lineNum - 1] || '').trim()\n      });\n    }\n  }\n}\n\nreturn {\n  ...d,\n  security_scan_pass1: {\n    flagged_count: candidates.length,\n    flagged_items: candidates\n  }\n};"
+      },
+      "id": "9b055fff-3b6c-42a8-a03a-c5fd51acfed7",
+      "name": "Pass 1 — Secret Scan1",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-4480, -2992]
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $input.first().json;\nconst flagged = d.security_scan_pass1.flagged_items || [];\n\n// Only send file content snippets, not entire files, to limit token usage\nconst fileSnippets = {};\nfor (const item of flagged) {\n  if (!fileSnippets[item.file]) {\n    const file = d.files.find(f => f.filename === item.file);\n    if (file && !file.binary) {\n      // Send first 2000 chars of each flagged file for context\n      fileSnippets[item.file] = (file.content || '').slice(0, 2000);\n    }\n  }\n}\n\nconst prompt = `You are a security engineer reviewing a software project before it is published to GitHub.\n\nProject: ${d.project_name}\nDetected framework: ${d.detection.framework}\nFiles in project: ${JSON.stringify(d.file_names)}\n\nPass 1 regex scan flagged these ${flagged.length} candidates:\n${JSON.stringify(flagged, null, 2)}\n\nFile context snippets (for the files containing flags):\n${JSON.stringify(fileSnippets, null, 2)}\n\nFor each candidate, determine:\n1. Is this a real secret (is_real: true) or a placeholder/example/test value (is_real: false)?\n2. If real, what ENV VAR name should replace it? (e.g. GEMINI_API_KEY, OPENAI_API_KEY)\n\nIMPORTANT: The index in your response MUST match the index from the flagged candidates array above.\nDo NOT renumber. Reference the original indexes exactly.\n\nReturn ONLY valid JSON in this exact format — no explanation, no markdown:\n{\n  \"summary\": \"2-3 sentence factual description of what this project does\",\n  \"tech_stack\": [\"list\", \"of\", \"technologies\", \"detected\"],\n  \"confirmed_secrets\": [\n    {\"index\": 0, \"is_real\": true, \"placeholder\": \"GEMINI_API_KEY\"},\n    {\"index\": 1, \"is_real\": false, \"placeholder\": \"\"}\n  ]\n}`;\n\nreturn {\n  ...d,\n  gemini_security_prompt: prompt\n};"
+      },
+      "id": "9fc5d42e-4367-4ee4-9a81-d506b272ca16",
+      "name": "Prepare AI Security Review1",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-4272, -2992]
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $input.first().json;\nconst remaining = [];\n\n// Same high-confidence patterns as Pass 1 — these should never survive sanitization\nconst patterns = [\n  /AIza[A-Za-z0-9_-]{35}/g,\n  /(?:ghp|gho|github_pat)_[A-Za-z0-9_]{20,}/g,\n  /sk-[A-Za-z0-9]{32,}/g,\n  /sk-ant-[A-Za-z0-9_-]{32,}/g,\n  /hf_[A-Za-z0-9]{32,}/g,\n  /AKIA[A-Z0-9]{16}/g,\n  /Bearer\\s+[A-Za-z0-9_.=-]{20,}/gi,\n  /(?:postgres(?:ql)?|mongodb(?:\\+srv)?|mysql|redis):\\/\\/[^\\s]+:[^\\s]+@/gi\n];\n\nfor (const file of d.files || []) {\n  // Skip .env.example — placeholders intentionally match some patterns\n  if (file.filename === '.env.example') continue;\n  if (file.binary || !file.content || file.content === '[binary file]') continue;\n\n  for (const pattern of patterns) {\n    const regex = new RegExp(pattern.source, pattern.flags);\n    let match;\n    while ((match = regex.exec(file.content)) !== null) {\n      remaining.push({\n        file: file.filename,\n        match: match[0].slice(0, 100)\n      });\n    }\n  }\n}\n\nreturn {\n  ...d,\n  security_scan_pass2: {\n    passed: remaining.length === 0,\n    remaining_secrets_count: remaining.length,\n    remaining_secrets: remaining\n  }\n};"
+      },
+      "id": "672a81ce-d5cf-44fb-bbe0-610ff7614f55",
+      "name": "Pass 2 — Verification Scan1",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-3696, -2992]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "leftValue": "={{ $json.security_scan_pass2.passed }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true" }
+            }
+          ],
+          "combinator": "and",
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          }
+        },
+        "options": {}
+      },
+      "id": "80797019-4199-436b-acc3-6d5e3c893b6f",
+      "name": "Security Gate1",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-3520, -2992]
+    },
+    {
+      "parameters": {
+        "sendTo": "=your-email@example.com",
+        "subject": "🚨 SECURITY BLOCK — {{ $json.project_name }}",
+        "message": "=<h2>🚨 Project Publication Blocked</h2><p><strong>{{ $json.project_name }}</strong> was NOT uploaded to GitHub because Pass 2 verification detected secrets that were not sanitized.</p><h3>Remaining secrets detected:</h3><pre>{{ JSON.stringify($json.security_scan_pass2.remaining_secrets, null, 2) }}</pre><p>Please manually review and remove these values, then re-submit.</p>",
+        "options": {}
+      },
+      "id": "bccec7d7-f50b-4219-b005-914355e0ec4c",
+      "name": "Security Block — Email Alert1",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [-3232, -3136],
+      "webhookId": "4549980a-64d7-4f41-9d2d-25ce242be0e9",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "YOUR_GMAIL_CREDENTIAL_ID",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "leftValue": "={{ $json.detection.track }}",
+              "rightValue": "B",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ],
+          "combinator": "and",
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          }
+        },
+        "options": {}
+      },
+      "id": "36c77dfc-870c-4f11-86e7-02503917cecd",
+      "name": "Is n8n Workflow?1",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-3232, -2960]
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $input.first().json;\n// This node receives already-Gemini-reviewed, already-sanitized files from the main pipeline.\n// It adds n8n-specific deep sanitization ON TOP of what was already done.\n\nconst workflowFile = d.files.find(f => f.filename === 'workflow.json' || f.filename.endsWith('/workflow.json'));\n\nif (!workflowFile) throw new Error('workflow.json not found after sanitization stage.');\n\nlet workflow;\ntry {\n  workflow = JSON.parse(workflowFile.content);\n} catch(e) {\n  throw new Error('workflow.json is not valid JSON: ' + e.message);\n}\n\nconst replaced = [];\n\n// FIX: Do NOT treat url/baseUrl/webhookUrl/endpoint as secrets.\n// Only target fields that are semantically credential-like.\nconst SECRET_KEYS = /^(api[_-]?key|apiKey|accessToken|refreshToken|password|passwd|secret|secretKey|clientSecret|authorization|bearerToken|privateKey|authToken|credential)$/i;\n\n// FIX: Skip values that are already placeholders or clearly not real secrets\nconst isAlreadyPlaceholder = v => /\\{\\{[A-Z0-9_]+\\}\\}|YOUR_|REPLACE_|<[^>]+>|^example$/i.test(v);\n\nfunction sanitizeParams(value, nodeName, keyName) {\n  if (Array.isArray(value)) return value.map(v => sanitizeParams(v, nodeName, keyName));\n  if (value === null || typeof value !== 'object') {\n    if (typeof value === 'string' && SECRET_KEYS.test(keyName) && value.length >= 8 && !isAlreadyPlaceholder(value)) {\n      const envName = keyName.toUpperCase().replace(/[^A-Z0-9]/g, '_');\n      replaced.push({ node: nodeName, key: keyName, placeholder: envName });\n      return `{{${envName}}}`;\n    }\n    return value;\n  }\n  const out = {};\n  for (const [key, val] of Object.entries(value)) {\n    if (key === 'credentials') continue; // Always strip credentials block\n    out[key] = sanitizeParams(val, nodeName, key);\n  }\n  return out;\n}\n\nconst sanitizedWorkflow = {\n  ...workflow,\n  nodes: (workflow.nodes || []).map(node => ({\n    ...node,\n    credentials: {}, // Always wipe credentials\n    parameters: sanitizeParams(node.parameters || {}, node.name || node.id || 'unknown_node')\n  }))\n};\n\n// Remove top-level credentials if present\ndelete sanitizedWorkflow.credentials;\n\n// Extract node structure for diagram generation (use stable IDs)\nconst workflow_structure = {\n  nodes: (workflow.nodes || []).map(n => ({\n    id: n.id,      // Use stable ID, not just name (names can be duplicated)\n    name: n.name,\n    type: n.type,\n    position: n.position\n  })),\n  connections: workflow.connections || {}\n};\n\n// Replace workflow.json content with sanitized version\nconst files = d.files.map(f => {\n  if (f.filename === workflowFile.filename) {\n    return { ...f, content: JSON.stringify(sanitizedWorkflow, null, 2) };\n  }\n  return f;\n});\n\n// Merge sanitization counts with what the main pipeline already did\nconst prevReplaced = d.sanitization?.secrets_replaced || 0;\n\nreturn {\n  ...d,\n  files,\n  workflow_structure,\n  sanitization: {\n    secrets_replaced: prevReplaced + replaced.length,\n    replacements: [...(d.sanitization?.replacements || []), ...replaced],\n    env_vars_generated: d.sanitization?.env_vars_generated || 0\n  }\n};"
+      },
+      "id": "f2b5f36f-4b91-4542-b36f-4519f2e68e0b",
+      "name": "n8n JSON Deep Sanitization1",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-2992, -2976]
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $input.first().json;\n\nif (!d.workflow_structure) {\n  return { ...d, has_visual: false, screenshot_status: 'skipped_no_ui', diagram_svg: null };\n}\n\nconst nodes = d.workflow_structure.nodes || [];\nconst connections = d.workflow_structure.connections || {};\n\nif (!nodes.length) {\n  return { ...d, has_visual: false, screenshot_status: 'skipped_no_ui', diagram_svg: null };\n}\n\n// Layout: use actual n8n positions where available\nconst BOX_W = 190;\nconst BOX_H = 60;\nconst PADDING = 60;\n\n// Compute bounding box of all node positions\nlet minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;\nnodes.forEach((node, i) => {\n  const p = node.position || [i * 230, 100];\n  const x = Number(p[0]);\n  const y = Number(p[1]);\n  minX = Math.min(minX, x);\n  minY = Math.min(minY, y);\n  maxX = Math.max(maxX, x + BOX_W);\n  maxY = Math.max(maxY, y + BOX_H);\n});\n\n// Normalize so all positions start from PADDING\nconst offsetX = PADDING - minX;\nconst offsetY = PADDING + 60 - minY; // +60 for title\n\nconst svgWidth = Math.max(1200, maxX - minX + BOX_W + PADDING * 2);\nconst svgHeight = Math.max(600, maxY - minY + BOX_H + PADDING * 2 + 60);\n\n// Build position map by node NAME (connections reference by name)\nconst posMap = {};\nnodes.forEach((node, i) => {\n  const p = node.position || [i * 230, 100];\n  posMap[node.name] = {\n    x: Number(p[0]) + offsetX,\n    y: Number(p[1]) + offsetY,\n    id: node.id\n  };\n});\n\nconst esc = s => String(s || '')\n  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\"/g, '&quot;');\n\n// Draw arrows\nconst arrows = [];\nfor (const [sourceName, outputs] of Object.entries(connections)) {\n  const src = posMap[sourceName];\n  if (!src) continue;\n  for (const groups of Object.values(outputs || {})) {\n    for (const group of (groups || [])) {\n      for (const target of (group || [])) {\n        const dst = posMap[target.node];\n        if (!dst) continue;\n        const x1 = src.x + BOX_W;\n        const y1 = src.y + BOX_H / 2;\n        const x2 = dst.x;\n        const y2 = dst.y + BOX_H / 2;\n        const mx = (x1 + x2) / 2;\n        arrows.push(`<path d=\"M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}\" fill=\"none\" stroke=\"#64748b\" stroke-width=\"1.5\" marker-end=\"url(#arrow)\"/>`);\n      }\n    }\n  }\n}\n\n// Draw node boxes\nconst boxes = nodes.map(node => {\n  const p = posMap[node.name];\n  const label = esc(node.name).slice(0, 26);\n  const sublabel = esc((node.type || '').split('.').pop()).slice(0, 30);\n  return [\n    `<rect x=\"${p.x}\" y=\"${p.y}\" width=\"${BOX_W}\" height=\"${BOX_H}\" rx=\"8\" fill=\"#1e293b\" stroke=\"#475569\" stroke-width=\"1\"/>`,\n    `<text x=\"${p.x + BOX_W / 2}\" y=\"${p.y + 22}\" text-anchor=\"middle\" fill=\"#f1f5f9\" font-size=\"11\" font-weight=\"600\" font-family=\"Arial,sans-serif\">${label}</text>`,\n    `<text x=\"${p.x + BOX_W / 2}\" y=\"${p.y + 40}\" text-anchor=\"middle\" fill=\"#94a3b8\" font-size=\"9\" font-family=\"Arial,sans-serif\">${sublabel}</text>`\n  ].join('');\n}).join('');\n\nconst svg = [\n  `<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"${svgWidth}\" height=\"${svgHeight}\">`,\n  `<defs><marker id=\"arrow\" markerWidth=\"8\" markerHeight=\"8\" refX=\"6\" refY=\"3\" orient=\"auto\"><path d=\"M0,0 L0,6 L8,3 z\" fill=\"#64748b\"/></marker></defs>`,\n  `<rect width=\"100%\" height=\"100%\" fill=\"#0f172a\"/>`,\n  `<text x=\"30\" y=\"40\" fill=\"#f8fafc\" font-size=\"18\" font-weight=\"700\" font-family=\"Arial,sans-serif\">${esc(d.project_name)} — n8n Workflow Diagram</text>`,\n  `<text x=\"30\" y=\"58\" fill=\"#64748b\" font-size=\"11\" font-family=\"Arial,sans-serif\">${nodes.length} nodes</text>`,\n  ...arrows,\n  boxes,\n  `</svg>`\n].join('');\n\nreturn {\n  ...d,\n  diagram_svg: svg,\n  has_visual: true,\n  screenshot_status: 'workflow_diagram_generated'\n};"
+      },
+      "id": "67274731-13b5-41fe-9906-f5ea1035e361",
+      "name": "Generate Workflow Diagram1",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-2768, -2976]
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $input.first().json;\n\nconst FILE_CONTENT_LIMIT = 800;\nconst fileContextLines = [];\n\nfor (const file of (d.files || [])) {\n  if (file.binary || file.content === '[binary file]') continue;\n  if (file.filename === '.env.example') continue;\n  const snippet = (file.content || '').slice(0, FILE_CONTENT_LIMIT);\n  fileContextLines.push(`### ${file.filename}\\n${snippet}${snippet.length >= FILE_CONTENT_LIMIT ? '\\n... [truncated]' : ''}`);\n  if (fileContextLines.join('').length > 8000) break;\n}\n\nconst envVars = d.sanitization?.replacements?.map(r => r.placeholder) || [];\n\nconst prompt = `Create a highly professional, visually structured README.md for this project. Use ONLY the information provided below — do not invent anything.\n\nProject Name: ${d.project_name}\nProject Type: ${d.detection?.type}\nFramework: ${d.detection?.framework}\nDomain: ${d.detection?.domain}\nShort Description: ${d.short_description || 'Not provided'}\nAI Analysis: ${d.gemini_analysis?.summary || 'Not available'}\nTech Stack: ${JSON.stringify(d.gemini_analysis?.tech_stack || [])}\nEntrypoint: ${d.detection?.entrypoint || 'Not detected'}\nStart Command: ${d.detection?.start_cmd || 'Not detected'}\nPort: ${d.detection?.port || 'N/A'}\nVisual/Screenshot: ${d.screenshot_status}\nEnvironment Variables Required: ${envVars.length ? envVars.join(', ') : 'None detected'}\n\nFile structure:\n${(d.file_names || []).join('\\n')}\n\nFile content snippets:\n${fileContextLines.join('\\n\\n')}\n\nSTRUCTURE — include ALL of these sections in this exact order:\n\n1. PROJECT TITLE & BADGES\n   - Large title with a relevant emoji\n   - Badges (use shields.io): Python version or framework badge, License badge, Status badge (Active)\n   - One-line tagline under the title\n\n2. OVERVIEW\n   - 2-3 sentence description of what this project does\n   - Use a blockquote (>) for the main value proposition\n\n3. FEATURES\n   - Use a markdown table with columns: Feature | Description | Status\n   - Each feature gets a checkmark emoji ✅ in Status column\n   - Extract features ONLY from the actual code provided\n\n4. TECH STACK\n   - Use a markdown table with columns: Technology | Purpose | Version\n   - Only include technologies visible in the code\n\n5. PROJECT STRUCTURE\n   - Use a code block with tree structure showing all files\n   - Add inline comments after each file explaining what it does\n\n6. GETTING STARTED\n   ### Prerequisites\n   - Bullet list of requirements (Python version, pip, etc.)\n   \n   ### Installation\n   - Numbered steps with code blocks for each command\n   \n   ### Environment Variables\n   - If env vars exist: markdown table with columns: Variable | Description | Required\n   - If none: say \"No environment variables required\"\n   \n   ### Running the App\n   - Code block with the exact start command\n\n7. VISUAL PREVIEW\n   - Only include if screenshot_status is 'captured' or 'workflow_diagram_generated'\n   - Add: ![App Screenshot](assets/screenshot.png) or ![Workflow](assets/workflow-diagram.svg)\n   - Add a caption under the image\n\n8. HOW IT WORKS\n   - Numbered list explaining the workflow/pipeline steps\n   - Extract ONLY from actual code — do not invent steps\n\n9. SECURITY\n   - Mention that secrets are handled via environment variables\n   - Add a note about .env.example\n\n10. LICENSE\n    - MIT License section\n    - Exact text: \"This project is licensed under the MIT License.\"\n\n11. AUTHOR\n    - Name: YOUR_NAME\n    - Title: YOUR_TITLE\n    - GitHub: YOUR_GITHUB_URL\n    - LinkedIn: YOUR_LINKEDIN_URL\n\nFORMATTING RULES:\n- Use emojis for every section heading (🚀 Overview, ✨ Features, 🛠️ Tech Stack, 📁 Structure, 🚀 Getting Started, 🖼️ Preview, ⚙️ How It Works, 🔒 Security, 📄 License, 👤 Author)\n- Use markdown tables wherever data has multiple attributes\n- Use code blocks for all commands\n- Use horizontal rules (---) between major sections\n- Make it look like a top 1% open source README\n- Return raw Markdown only — no code fences around the entire response\n- Do NOT invent features, metrics, users, or capabilities not visible in the code`;\n\nreturn {\n  ...d,\n  readme_prompt: prompt\n};"
+      },
+      "id": "619f389c-7329-495d-bc77-7daa61b8c75b",
+      "name": "Prepare README Prompt1",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-4368, -2720]
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $input.first().json;\n\nconst filesSummary = (d.files || [])\n  .filter(f => !f.binary && f.content && f.content !== '[binary file]')\n  .map(f => `FILE: ${f.filename}\\n${(f.content || '').slice(0, 800)}`)\n  .join('\\n\\n---\\n\\n');\n\nconst prompt = `You are a LinkedIn content writer for a software developer. Generate a structured LinkedIn post and GitHub metadata.\n\nPROJECT DETAILS:\n- Name: ${d.project_name}\n- Framework: ${d.detection?.framework || 'Python'}\n- Type: ${d.detection?.type || 'python_project'}\n- AI Summary: ${d.gemini_analysis?.summary || ''}\n- Tech Stack: ${JSON.stringify(d.gemini_analysis?.tech_stack || [])}\n- Tone: ${d.linkedin_tone || 'Professional'}\n\nPROJECT FILE CONTENTS (read carefully to understand what this project actually does):\n${filesSummary}\n\nREADME EXCERPT:\n${(d.readme_content || '').slice(0, 600)}\n\n---\n\nTASK 1 — repo_description:\nWrite max 350 characters. Factual. No hype. Describe what it does technically.\n\nTASK 2 — topics:\nArray of 8-10 lowercase GitHub topic strings. Example: [\"python\", \"streamlit\", \"automation\"]\n\nTASK 3 — linkedin_post:\nWrite EXACTLY this structure. Do NOT deviate. Do NOT write a short caption.\n\n[HOOK LINE]\nOne powerful line. No emoji. Must mention the problem solved and what was built.\nExample: \"I was spending 3 hours releasing every project manually. So I automated the entire thing.\"\n\n[BLANK LINE]\n\nHere is what it does:\n🔍 [Feature 1 from actual code] — [short description]\n📄 [Feature 2 from actual code] — [short description]\n🐙 [Feature 3 from actual code] — [short description]\n📸 [Feature 4 from actual code] — [short description]\n✍️ [Feature 5 from actual code] — [short description]\n✅ [Feature 6 from actual code] — [short description]\n\n[BLANK LINE]\n\nBuilt with: [tech1] — [tech2] — [tech3] — [list all from tech stack]\n\n[BLANK LINE]\n\n[One powerful insight or lesson from building this. Make it memorable.]\n[One final punchy line. Make people want to build something.]\n\n[BLANK LINE]\n\n#[hashtag1] #[hashtag2] #[hashtag3] [12-15 total hashtags, mix of tech + career + domain]\n\nSTRICT RULES:\n- linkedin_post MUST have all 4 sections above\n- MUST have exactly 6 emoji features\n- Features MUST come from actual file contents above — not invented\n- Hook line MUST NOT start with \"I just built and published\"\n- Total words in linkedin_post: 160-220 words (excluding hashtags)\n- Return ONLY valid JSON. No markdown. No explanation.\n\nRETURN FORMAT:\n{\"repo_description\": \"...\", \"topics\": [\"...\"], \"linkedin_post\": \"...\"}`;\n\nreturn {\n  ...d,\n  metadata_prompt: prompt\n};"
+      },
+      "id": "ef72b48f-67f8-48cc-aaa4-51626d589542",
+      "name": "Prepare GitHub + LinkedIn Prompt1",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-3760, -2720]
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $input.first().json;\nconst token = \"YOUR_GITHUB_TOKEN_HERE\";\n\nconst repoName = (d.project_name || 'untitled-project')\n  .trim()\n  .replace(/[^a-zA-Z0-9-\\s]/g, '')\n  .replace(/\\s+/g, '-')\n  .replace(/-+/g, '-')\n  .replace(/^-|-$/g, '')\n  .slice(0, 100) || 'Untitled-Project';\n\n// n8n 2.33.5 mein built-in helpers check karo\nconst helpers = $execution?.customData || {};\n\n// Sirf data prepare karo — actual API call HTTP Request node karega\nreturn {\n  ...d,\n  github_repo_name: repoName,\n  github_payload: {\n    name: repoName,\n    description: (d.github_metadata?.repo_description || d.project_name || '').slice(0, 350),\n    private: d.github_visibility === 'private',\n    auto_init: false,\n    has_issues: true,\n    has_projects: false,\n    has_wiki: false\n  },\n  github_token: token\n};"
+      },
+      "id": "854cae41-1cb5-481f-9511-8a36e51b72cb",
+      "name": "Create GitHub Repo + Push Files1",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-3184, -2720]
+    },
+    {
+      "parameters": {
+        "sendTo": "=your-email@example.com",
+        "subject": "=✅ Review & Approve LinkedIn Post — {{ $json.project_name }}",
+        "message": "=<h2 style=\"font-family:Arial;\">Your project is on GitHub ✅</h2>\n<table style=\"font-family:Arial;border-collapse:collapse;width:100%\">\n  <tr>\n    <td style=\"padding:8px;border:1px solid #ddd;font-weight:600\">Project</td>\n    <td style=\"padding:8px;border:1px solid #ddd\">{{ $json.project_name }}</td>\n  </tr>\n  <tr>\n    <td style=\"padding:8px;border:1px solid #ddd;font-weight:600\">GitHub URL</td>\n    <td style=\"padding:8px;border:1px solid #ddd\"><a href=\"{{ $json.github_url }}\">{{ $json.github_url }}</a></td>\n  </tr>\n  <tr>\n    <td style=\"padding:8px;border:1px solid #ddd;font-weight:600\">Framework</td>\n    <td style=\"padding:8px;border:1px solid #ddd\">{{ $json.detection.framework }}</td>\n  </tr>\n  <tr>\n    <td style=\"padding:8px;border:1px solid #ddd;font-weight:600\">Secrets Replaced</td>\n    <td style=\"padding:8px;border:1px solid #ddd\">{{ $json.sanitization.secrets_replaced }}</td>\n  </tr>\n</table>\n<hr>\n<h3 style=\"font-family:Arial;\">LinkedIn Post Draft</h3>\n<pre style=\"background:#f4f4f4;padding:12px;border-radius:4px;white-space:pre-wrap;font-family:Arial;font-size:13px;\">{{ $json.github_metadata.linkedin_post }}</pre>\n<hr>\n<p style=\"font-family:Arial;\">Click to approve or reject:</p>\n<p>\n  <a href=\"{{ $execution.resumeUrl }}&approved=true\" \n     style=\"background:#0077b5;color:white;padding:14px 28px;text-decoration:none;border-radius:6px;margin-right:16px;font-family:Arial;font-size:15px;display:inline-block;\">\n    ✅ APPROVE &amp; PUBLISH\n  </a>\n  <a href=\"{{ $execution.resumeUrl }}&approved=false\" \n     style=\"background:#dc2626;color:white;padding:14px 28px;text-decoration:none;border-radius:6px;font-family:Arial;font-size:15px;display:inline-block;\">\n    ❌ REJECT\n  </a>\n</p>\n<p style=\"font-family:Arial;color:#888;font-size:12px;\">\n  Approve URL: {{ $execution.resumeUrl }}&approved=true<br>\n  Reject URL: {{ $execution.resumeUrl }}&approved=false<br>\n  Expires in 24 hours.\n</p>",
+        "options": { "appendAttribution": false }
+      },
+      "id": "9999d2e4-4b31-4976-bd82-d0aab1cda10d",
+      "name": "LinkedIn Approval Email1",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [-4128, -2096],
+      "webhookId": "396c454b-d8d4-4e96-89d5-dec550f640b6",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "YOUR_GMAIL_CREDENTIAL_ID",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://127.0.0.1:9000/screenshot",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ files: $json.files.filter(f => !f.binary && f.content && f.content !== '[binary file]'), entrypoint: $json.detection.entrypoint || 'app.py' }) }}",
+        "options": { "timeout": 60000 }
+      },
+      "id": "80469b6e-f973-4421-be5e-34674991bf0b",
+      "name": "Take App Screenshot",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-4848, -2720],
+      "retryOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const screenshotData = $input.first().json;\nconst pipelineData = $('Sanitization').first().json;\n\nreturn {\n  ...pipelineData,\n  screenshot_b64: screenshotData.screenshot || screenshotData.screenshot_b64 || null,\n  screenshot_taken: !!(screenshotData.screenshot || screenshotData.screenshot_b64),\n  screenshot_public_url: screenshotData.public_url || null,\n  has_visual: !!(screenshotData.screenshot || screenshotData.screenshot_b64),\n  screenshot_status: (screenshotData.screenshot || screenshotData.screenshot_b64) ? 'captured' : 'failed'\n};"
+      },
+      "id": "b1a7a7fa-0a78-4c20-93ca-90559645c203",
+      "name": "Attach Screenshot",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-4608, -2720]
+    },
+    {
+      "parameters": {
+        "jsCode": "const response = $input.first().json;\nconst original = $('Prepare AI Security Review1').first().json;\n\n// Groq format\nconst raw = response.choices?.[0]?.message?.content || '{}';\nlet ai;\n\ntry {\n  const cleaned = raw.replace(/^```json\\n?|\\n?```$/g, '').trim();\n  ai = JSON.parse(cleaned);\n} catch {\n  ai = { summary: '', tech_stack: [], confirmed_secrets: [] };\n}\n\nconst flagged = original.security_scan_pass1.flagged_items || [];\nconst confirmed = (ai.confirmed_secrets || []).filter(x => x.is_real === true);\n\nlet files = original.files.map(f => ({ ...f }));\nconst replacements = [];\nconst envVars = {};\n\nfunction escapeRegex(str) {\n  return str.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');\n}\n\nfor (const secret of confirmed) {\n  const candidate = flagged.find(x => x.index === secret.index);\n  if (!candidate) continue;\n\n  const envName = String(secret.placeholder || 'SECRET')\n    .toUpperCase()\n    .replace(/[^A-Z0-9_]/g, '_');\n\n  const placeholder = `{{${envName}}}`;\n  envVars[envName] = `your_${envName.toLowerCase()}_here`;\n\n  files = files.map(file => {\n    if (file.filename !== candidate.file) return file;\n    return {\n      ...file,\n      content: file.content.replace(new RegExp(escapeRegex(candidate.match), 'g'), placeholder)\n    };\n  });\n\n  replacements.push({\n    file: candidate.file,\n    line: candidate.line,\n    type: candidate.type,\n    placeholder: envName\n  });\n}\n\nconst envFile = files.find(f => f.is_env_file && !f.binary);\nif (envFile) {\n  for (const line of (envFile.content || '').split('\\n')) {\n    const match = line.match(/^([A-Z0-9_]+)=/);\n    if (match && !envVars[match[1]]) {\n      envVars[match[1]] = `your_${match[1].toLowerCase()}_here`;\n    }\n  }\n}\n\nfiles = files.filter(f => !f.is_env_file);\n\nconst envExample = Object.entries(envVars)\n  .map(([key, value]) => `${key}=${value}`)\n  .join('\\n');\n\nif (envExample) {\n  files.push({\n    filename: '.env.example',\n    content: envExample,\n    extension: 'example',\n    binary: false,\n    is_env_file: false\n  });\n}\n\nreturn {\n  ...original,\n  files,\n  gemini_analysis: {\n    summary: ai.summary || '',\n    tech_stack: ai.tech_stack || []\n  },\n  sanitization: {\n    secrets_replaced: replacements.length,\n    replacements,\n    env_vars_generated: Object.keys(envVars).length\n  }\n};"
+      },
+      "id": "23cc3f9f-dfca-45eb-8c46-dbd42b24c592",
+      "name": "Sanitization",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-3888, -2992]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "Bearer YOUR_GROQ_API_KEY_HERE" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'openai/gpt-oss-20b', messages: [{ role: 'user', content: $json.gemini_security_prompt }], temperature: 0.1, response_format: { type: 'json_object' } }) }}",
+        "options": {}
+      },
+      "id": "9bc9313e-b867-4304-a364-629f12095113",
+      "name": "Groq — Project Analysis + Security",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-4064, -2992],
+      "retryOnFail": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.github.com/user/repos",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "={{ 'Bearer ' + $json.github_token }}" },
+            { "name": "Accept", "value": "application/vnd.github+json" },
+            { "name": "X-GitHub-Api-Version", "value": "2022-11-28" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.github_payload) }}",
+        "options": {}
+      },
+      "id": "a5b91393-198b-47e5-84ed-693723b7f4cf",
+      "name": "GitHub — Create Repo",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-4528, -2448]
+    },
+    {
+      "parameters": {
+        "jsCode": "const repoData = $input.first().json;\nconst d = $('Create GitHub Repo + Push Files1').first().json;\n\nif (repoData.message) {\n  throw new Error('GitHub repo creation failed: ' + repoData.message);\n}\n\nconst owner = repoData.owner.login;\nconst repoName = d.github_repo_name;\nconst token = d.github_token;\n\n// Saari files prepare karo upload ke liye\nconst uploads = [];\n\n// README\nuploads.push({\n  path: 'README.md',\n  content: Buffer.from(d.readme_content || '# ' + d.project_name, 'utf8').toString('base64'),\n  message: 'chore: add README'\n});\n\n// Project files\nfor (const file of (d.files || [])) {\n  if (file.binary || !file.content || file.content === '[binary file]') continue;\n  uploads.push({\n    path: file.filename,\n    content: Buffer.from(file.content, 'utf8').toString('base64'),\n    message: 'chore: add ' + file.filename\n  });\n}\n\n// Screenshot\nif (d.screenshot_b64 && d.screenshot_taken) {\n  uploads.push({\n    path: 'assets/screenshot.png',\n    content: d.screenshot_b64,\n    message: 'chore: add screenshot'\n  });\n}\n\n// SVG diagram\nif (d.diagram_svg) {\n  uploads.push({\n    path: 'assets/workflow-diagram.svg',\n    content: Buffer.from(d.diagram_svg, 'utf8').toString('base64'),\n    message: 'chore: add workflow diagram'\n  });\n}\n\nreturn {\n  ...d,\n  github_url: repoData.html_url,\n  github_owner: owner,\n  github_repo: repoName,\n  github_token: token,      // ← FIX 1: token return ho raha hai\n  uploads: uploads,          // ← FIX 2: uploads array return ho raha hai\n  upload_index: 0,           // ← FIX 3: loop counter\n  github_status: 'created',\n  github_upload_errors: []\n};"
+      },
+      "id": "dd33f859-6570-4539-b999-c1eafbd4cdea",
+      "name": "GitHub — Prepare Uploads",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-4304, -2448]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "leftValue": "={{ $json.uploads_done }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true" }
+            }
+          ],
+          "combinator": "and",
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          }
+        },
+        "options": {}
+      },
+      "id": "08daf766-5266-4246-bc2c-29a0b73cf6f8",
+      "name": "GitHub — All Files Done?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-3648, -2448]
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $input.first().json;\nconst token = d.github_token;\nconst owner = d.github_owner;\nconst repo = d.github_repo;\n\nif (!token || !owner || !repo) {\n  throw new Error(`Missing: token=${!!token}, owner=${owner}, repo=${repo}`);\n}\n\nconst allUploads = [];\n\n// README\nallUploads.push({\n  path: 'README.md',\n  content: Buffer.from(d.readme_content || '# ' + d.project_name, 'utf8').toString('base64'),\n  message: 'chore: add README'\n});\n\n// Project files\nfor (const file of (d.files || [])) {\n  if (file.binary || !file.content || file.content === '[binary file]') continue;\n  allUploads.push({\n    path: file.filename,\n    content: Buffer.from(file.content, 'utf8').toString('base64'),\n    message: 'chore: add ' + file.filename\n  });\n}\n\n// Screenshot\nif (d.screenshot_b64 && d.screenshot_taken) {\n  allUploads.push({\n    path: 'assets/screenshot.png',\n    content: d.screenshot_b64,\n    message: 'chore: add screenshot'\n  });\n}\n\n// SVG Diagram\nif (d.diagram_svg) {\n  allUploads.push({\n    path: 'assets/workflow-diagram.svg',\n    content: Buffer.from(d.diagram_svg, 'utf8').toString('base64'),\n    message: 'chore: add workflow diagram'\n  });\n}\n\nconst errors = [];\nconst uploaded = [];\n\nfor (const upload of allUploads) {\n  try {\n    await this.helpers.httpRequest({\n      method: 'PUT',\n      url: `https://api.github.com/repos/${owner}/${repo}/contents/${upload.path}`,\n      headers: {\n        'Authorization': `Bearer ${token}`,\n        'Accept': 'application/vnd.github+json',\n        'X-GitHub-Api-Version': '2022-11-28',\n        'Content-Type': 'application/json'\n      },\n      body: JSON.stringify({\n        message: upload.message,\n        content: upload.content\n      })\n    });\n    uploaded.push(upload.path);\n  } catch(e) {\n    const msg = e?.response?.body?.message || e?.message || 'unknown error';\n    errors.push(`${upload.path}: ${msg}`);\n  }\n}\n\nreturn {\n  ...d,\n  uploads_done: true,\n  github_upload_errors: errors,\n  upload_count: allUploads.length,\n  uploaded_files: uploaded\n};"
+      },
+      "id": "7d73bb47-8b86-43e7-8951-9e83489625f9",
+      "name": "GitHub — Upload + Next",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-4064, -2448]
+    },
+    {
+      "parameters": {
+        "resume": "webhook",
+        "limitWaitTime": true,
+        "resumeAmount": 24,
+        "options": {}
+      },
+      "id": "17fa080b-af44-4c2f-8420-525de70ded02",
+      "name": "Wait for Approval1",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1,
+      "position": [-3872, -2096],
+      "webhookId": "0ba4141e-eb06-44a2-ad08-be28f83931ea"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "conditions": [
+            {
+              "leftValue": "={{ $json.query?.approved }}",
+              "rightValue": "true",
+              "operator": { "type": "string", "operation": "equals" }
+            }
+          ],
+          "combinator": "and",
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          }
+        },
+        "options": {}
+      },
+      "id": "c60d1479-e827-42ff-918d-f8ddfcbe0d52",
+      "name": "Approved?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-3648, -2096]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.linkedin.com/rest/posts",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "Bearer YOUR_LINKEDIN_ACCESS_TOKEN_HERE" },
+            { "name": "LinkedIn-Version", "value": "202606" },
+            { "name": "X-Restli-Protocol-Version", "value": "2.0.0" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  author: \"urn:li:person:YOUR_LINKEDIN_PERSON_ID\",\n  commentary: $('Prepare Image Binary').first().json.github_metadata?.linkedin_post || \"Check out my latest project!\",\n  visibility: \"PUBLIC\",\n  distribution: {\n    feedDistribution: \"MAIN_FEED\",\n    targetEntities: [],\n    thirdPartyDistributionChannels: []\n  },\n  lifecycleState: \"PUBLISHED\",\n  isReshareDisabledByAuthor: false,\n  content: {\n    media: {\n      id: $('Prepare Image Binary').first().json.image_asset_id\n    }\n  }\n}) }}",
+        "options": {
+          "response": {
+            "response": { "fullResponse": true }
+          }
+        }
+      },
+      "id": "4b3e1105-47ff-4aed-8c61-f4bfbad3764a",
+      "name": "Publish LinkedIn",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [-3248, -2160],
+      "retryOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "const waitData = $('Wait for Approval1').first().json;\nreturn {\n  ...waitData,\n  linkedin_status: 'rejected',\n  linkedin_rejection_reason: 'User clicked reject in approval email'\n};"
+      },
+      "id": "39178e8c-33f9-4692-b3fd-c3d5998c63a6",
+      "name": "LinkedIn Rejected",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-3232, -2000]
+    },
+    {
+      "parameters": {
+        "jsCode": "const linkedin = $input.first().json;\nconst original = $('Wait for Approval1').first().json;\n\n// LinkedIn post ID headers se lo\nconst headers = linkedin.headers || {};\nconst linkedinPostId = \n  headers['x-restli-id'] ||\n  headers['x-linkedin-id'] ||\n  linkedin?.id ||\n  linkedin?.value ||\n  null;\n\nconst isDuplicate = JSON.stringify(linkedin).toLowerCase().includes('duplicate');\nconst isSuccess = !!linkedinPostId || isDuplicate;\n\nlet linkedinPostUrl = null;\nif (linkedinPostId) {\n  const shareId = linkedinPostId.toString().replace('urn:li:share:', '');\n  linkedinPostUrl = `https://www.linkedin.com/feed/update/urn:li:share:${shareId}/`;\n}\n\n// FIX: Har possible node se data lo — jo pehle mile woh use karo\nfunction getFromAnyNode(field) {\n  const nodes = [\n    'Wait for Approval1',\n    'LinkedIn Approval Email1', \n    'GitHub — All Files Done?',\n    'GitHub — Upload + Next',\n    'GitHub — Prepare Uploads',\n    'GitHub — Create Repo',\n    'Create GitHub Repo + Push Files1',\n    'Parse GitHub Metadata1',\n    'Parse README1'\n  ];\n  \n  for (const nodeName of nodes) {\n    try {\n      const val = $(nodeName).first().json[field];\n      if (val !== undefined && val !== null && val !== '') {\n        return val;\n      }\n    } catch(e) {\n      continue;\n    }\n  }\n  return '';\n}\n\n// Saare fields collect karo\nconst project_name = getFromAnyNode('project_name');\nconst github_url = getFromAnyNode('github_url');\nconst github_owner = getFromAnyNode('github_owner');\nconst github_repo = getFromAnyNode('github_repo');\nconst github_repo_name = getFromAnyNode('github_repo_name');\nconst user_email = getFromAnyNode('user_email');\nconst github_visibility = getFromAnyNode('github_visibility');\nconst linkedin_tone = getFromAnyNode('linkedin_tone');\nconst screenshot_status = getFromAnyNode('screenshot_status');\nconst readme_content = getFromAnyNode('readme_content');\n\n// Objects\nlet detection = {};\nlet sanitization = {};\nlet github_metadata = {};\nlet gemini_analysis = {};\n\nconst nodeNames = [\n  'Wait for Approval1',\n  'LinkedIn Approval Email1',\n  'GitHub — All Files Done?',\n  'Parse GitHub Metadata1'\n];\n\nfor (const nodeName of nodeNames) {\n  try {\n    const d = $(nodeName).first().json;\n    if (d.detection && Object.keys(d.detection).length) detection = d.detection;\n    if (d.sanitization && Object.keys(d.sanitization).length) sanitization = d.sanitization;\n    if (d.github_metadata && Object.keys(d.github_metadata).length) github_metadata = d.github_metadata;\n    if (d.gemini_analysis && Object.keys(d.gemini_analysis).length) gemini_analysis = d.gemini_analysis;\n  } catch(e) {\n    continue;\n  }\n}\n\nreturn {\n  // Project info\n  project_name,\n  github_url,\n  github_owner,\n  github_repo: github_repo || github_repo_name,\n  user_email,\n  github_visibility,\n  linkedin_tone,\n  screenshot_status,\n  readme_content,\n  \n  // Objects\n  detection,\n  sanitization,\n  github_metadata,\n  gemini_analysis,\n  \n  // LinkedIn result\n  linkedin_response: linkedin,\n  linkedin_status: isSuccess ? 'published' : 'failed',\n  linkedin_post_id: linkedinPostId || 'unknown',\n  linkedin_post_url: linkedinPostUrl || 'https://www.linkedin.com/feed/',\n  \n  // Query params\n  query: original.query || {}\n};"
+      },
+      "id": "e4f8e1cc-59fe-4294-9c55-ec5d21708770",
+      "name": "Normalize LinkedIn Result1",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-3072, -2160]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID_HERE",
+          "mode": "list",
+          "cachedResultName": "AI-Powered Project Release & Publishing Agent"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "Project_Releases"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Project Name": "={{ $json.project_name }}",
+            "Framework": "={{ $json.detection?.framework || '' }}",
+            "Track": "={{ $json.detection?.track || '' }}",
+            "GitHub URL": "={{ $json.github_url || '' }}",
+            "LinkedIn URL": "={{ $json.linkedin_post_url || '' }}",
+            "Security Status": "=PASSED",
+            "Secrets Replaced": "={{ $json.sanitization?.secrets_replaced || 0 }}",
+            "LinkedIn Status": "={{ $json.linkedin_status || 'unknown' }}",
+            "Date": "={{ new Date().toISOString() }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            { "id": "Project Name", "displayName": "Project Name", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "Track", "displayName": "Track", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "Framework", "displayName": "Framework", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "GitHub URL", "displayName": "GitHub URL", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "LinkedIn URL", "displayName": "LinkedIn URL", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "Security Status", "displayName": "Security Status", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "Secrets Replaced", "displayName": "Secrets Replaced", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "LinkedIn Status", "displayName": "LinkedIn Status", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true },
+            { "id": "Date", "displayName": "Date", "required": false, "defaultMatch": false, "display": true, "type": "string", "canBeUsedToMatch": true }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "a6fa0d4a-dae5-4d8e-afc5-e0534456d6b9",
+      "name": "Log to Google Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [-2896, -2160],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "YOUR_GOOGLE_SHEETS_CREDENTIAL_ID",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_GOOGLE_SHEET_ID_HERE",
+          "mode": "list",
+          "cachedResultName": "AI-Powered Project Release & Publishing Agent"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "gid=0",
+          "mode": "list",
+          "cachedResultName": "Project_Releases"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Project Name": "={{ $json.project_name }}",
+            "Framework": "={{ $json.detection?.framework || '' }}",
+            "Track": "={{ $json.detection?.track || '' }}",
+            "GitHub URL": "={{ $json.github_url || '' }}",
+            "LinkedIn URL": "=REJECTED",
+            "Security Status": "=PASSED",
+            "Secrets Replaced": "={{ $json.sanitization?.secrets_replaced || 0 }}",
+            "LinkedIn Status": "=rejected",
+            "Date": "={{ new Date().toISOString() }}"
+          },
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "b2ee999d-4e6c-477e-9136-3da46a08ca00",
+      "name": "Log Rejection to Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [-2944, -2000],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "YOUR_GOOGLE_SHEETS_CREDENTIAL_ID",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "sendTo": "=your-email@example.com",
+        "subject": "=🚀 Release Complete —  {{ $json['Project Name'] }}",
+        "message": "==<div style=\"font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#ffffff;border:1px solid #e0e0e0;border-radius:8px;overflow:hidden\">\n  <div style=\"background:#0f172a;padding:24px 32px\">\n    <h1 style=\"color:#f8fafc;margin:0;font-size:22px\">🚀 Project Release Complete</h1>\n    <p style=\"color:#94a3b8;margin:6px 0 0 0;font-size:13px\">Your project has been published successfully</p>\n  </div>\n  <div style=\"padding:32px\">\n    <table style=\"width:100%;border-collapse:collapse\">\n      <tr style=\"background:#f8fafc\">\n        <td style=\"padding:12px 16px;border:1px solid #e2e8f0;font-weight:600;color:#374151;width:35%\">Project</td>\n        <td style=\"padding:12px 16px;border:1px solid #e2e8f0;color:#1e293b\">{{ $json.project_name }}</td>\n      </tr>\n      <tr>\n        <td style=\"padding:12px 16px;border:1px solid #e2e8f0;font-weight:600;color:#374151\">Framework</td>\n        <td style=\"padding:12px 16px;border:1px solid #e2e8f0;color:#1e293b\">{{ $json.detection?.framework || '' }}</td>\n      </tr>\n      <tr style=\"background:#f8fafc\">\n        <td style=\"padding:12px 16px;border:1px solid #e2e8f0;font-weight:600;color:#374151\">GitHub</td>\n        <td style=\"padding:12px 16px;border:1px solid #e2e8f0\"><a href=\"{{ $json.github_url }}\" style=\"color:#0077b5;text-decoration:none\">{{ $json.github_url }}</a></td>\n      </tr>\n      <tr>\n        <td style=\"padding:12px 16px;border:1px solid #e2e8f0;font-weight:600;color:#374151\">LinkedIn Post</td>\n        <td style=\"padding:12px 16px;border:1px solid #e2e8f0\"><a href=\"{{ $json.linkedin_post_url }}\" style=\"color:#0077b5;text-decoration:none\">{{ $json.linkedin_post_url }}</a></td>\n      </tr>\n      <tr style=\"background:#f8fafc\">\n        <td style=\"padding:12px 16px;border:1px solid #e2e8f0;font-weight:600;color:#374151\">LinkedIn Status</td>\n        <td style=\"padding:12px 16px;border:1px solid #e2e8f0;color:#1e293b\">{{ $json.linkedin_status }}</td>\n      </tr>\n      <tr>\n        <td style=\"padding:12px 16px;border:1px solid #e2e8f0;font-weight:600;color:#374151\">Security</td>\n        <td style=\"padding:12px 16px;border:1px solid #e2e8f0\"><span style=\"color:#16a34a;font-weight:600\">PASSED ✅</span></td>\n      </tr>\n      <tr style=\"background:#f8fafc\">\n        <td style=\"padding:12px 16px;border:1px solid #e2e8f0;font-weight:600;color:#374151\">Secrets Replaced</td>\n        <td style=\"padding:12px 16px;border:1px solid #e2e8f0;color:#1e293b\">{{ $json.sanitization?.secrets_replaced || 0 }}</td>\n      </tr>\n      <tr>\n        <td style=\"padding:12px 16px;border:1px solid #e2e8f0;font-weight:600;color:#374151\">Screenshot</td>\n        <td style=\"padding:12px 16px;border:1px solid #e2e8f0;color:#1e293b\">{{ $json.screenshot_status }}</td>\n      </tr>\n      <tr style=\"background:#f8fafc\">\n        <td style=\"padding:12px 16px;border:1px solid #e2e8f0;font-weight:600;color:#374151\">Track</td>\n        <td style=\"padding:12px 16px;border:1px solid #e2e8f0;color:#1e293b\">{{ $json.detection?.track || '' }}</td>\n      </tr>\n    </table>\n    <div style=\"margin-top:24px;padding:16px;background:#f0fdf4;border-left:4px solid #16a34a;border-radius:4px\">\n      <p style=\"margin:0;color:#15803d;font-size:14px\">✅ All pipeline stages completed successfully. Your project is live on GitHub and LinkedIn.</p>\n    </div>\n    <p style=\"margin-top:24px;color:#94a3b8;font-size:12px;text-align:center\">AI-Powered Project Release Agent • {{ new Date().toLocaleString() }}</p>\n  </div>\n</div>",
+        "options": { "appendAttribution": false }
+      },
+      "id": "815d1054-a6b1-4826-8bd5-f9bdb71c9a11",
+      "name": "Send Summary Email1",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [-2592, -2160],
+      "webhookId": "c462ecfa-e508-478f-914a-d95d4a86d3a0",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "YOUR_GMAIL_CREDENTIAL_ID",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const waitData = $input.first().json;\nconst projectData = $('Parse GitHub Metadata').first().json;\nconst screenshotData = $('Attach Screenshot').first().json;\n\nreturn {\n  ...projectData,\n  query: waitData.query,\n  screenshot_status: screenshotData?.screenshot_status || projectData?.screenshot_status || 'none',\n  screenshot_b64: screenshotData?.screenshot_b64 || null,\n  github_upload_errors: projectData?.github_upload_errors || []\n};"
+      },
+      "id": "dc0f6ad2-ca9c-4574-b410-db997afbe85f",
+      "name": "Restore Project Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-3424, -2384]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.linkedin.com/rest/images?action=initializeUpload",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "Bearer YOUR_LINKEDIN_ACCESS_TOKEN_HERE" },
+            { "name": "LinkedIn-Version", "value": "202606" },
+            { "name": "X-Restli-Protocol-Version", "value": "2.0.0" },
+            { "name": "Content-Type", "value": "application/json" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ initializeUploadRequest: { owner: 'urn:li:person:YOUR_LINKEDIN_PERSON_ID' } }) }}",
+        "options": {}
+      },
+      "id": "452b5b08-a804-4e8b-9280-1fb81ff1d6b5",
+      "name": "Register Image Upload",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [-3200, -2384]
+    },
+    {
+      "parameters": {
+        "jsCode": "const registerData = $input.first().json;\nconst projectData = $('Restore Project Data').first().json;\n\nconst uploadUrl = registerData.value?.uploadUrl;\nconst imageAssetId = registerData.value?.image;\n\nif (!uploadUrl) {\n  throw new Error('LinkedIn image upload URL not received: ' + JSON.stringify(registerData));\n}\n\n// screenshot_b64 Restore Project Data se lo\n// jo Attach Screenshot node se aata hai\nconst base64 = projectData.screenshot_b64 || '';\n\nif (!base64) {\n  throw new Error('screenshot_b64 missing — Attach Screenshot node ne return nahi kiya. screenshot_status: ' + projectData.screenshot_status);\n}\n\n// base64 mein data:image/png;base64, prefix ho sakta hai — strip karo\nconst cleanBase64 = base64.replace(/^data:image\\/\\w+;base64,/, '');\n\nreturn [\n  {\n    json: {\n      upload_url: uploadUrl,\n      image_asset_id: imageAssetId,\n      project_name: projectData.project_name,\n      github_metadata: projectData.github_metadata\n    },\n    binary: {\n      data: {\n        data: cleanBase64,\n        mimeType: 'image/png',\n        fileName: 'screenshot.png'\n      }\n    }\n  }\n];"
+      },
+      "id": "473dad87-43f1-4e7a-9e9e-7ab9dea82550",
+      "name": "Prepare Image Binary",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-2976, -2384]
+    },
+    {
+      "parameters": {
+        "method": "PUT",
+        "url": "={{ $json.upload_url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "Bearer YOUR_LINKEDIN_ACCESS_TOKEN_HERE" },
+            { "name": "Content-Type", "value": "application/octet-stream" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "binaryData",
+        "inputDataFieldName": "data",
+        "options": {}
+      },
+      "id": "9f694b6c-5ec1-442c-a423-c1e176252522",
+      "name": "Upload Image Binary",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [-2736, -2384]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "Bearer YOUR_OPENROUTER_API_KEY_HERE" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "HTTP-Referer", "value": "http://localhost:5678" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'nvidia/nemotron-3-ultra-550b-a55b:free', messages: [{ role: 'user', content: $json.readme_prompt }], temperature: 0.8 }) }}",
+        "options": {}
+      },
+      "id": "5152cfcc-9fae-4c4e-952a-98a0019f25a3",
+      "name": "OpenRouter — README Generation",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-4160, -2720],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "Authorization", "value": "Bearer YOUR_OPENROUTER_API_KEY_HERE" },
+            { "name": "Content-Type", "value": "application/json" },
+            { "name": "HTTP-Referer", "value": "http://localhost:5678" }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ \n  model: 'nvidia/nemotron-3-ultra-550b-a55b:free',\n  messages: [\n    { \n      role: 'system', \n      content: 'You are a JSON API. Return ONLY valid JSON. No markdown. No explanation. No code fences. Just the raw JSON object.'\n    },\n    { \n      role: 'user', \n      content: $json.metadata_prompt \n    }\n  ], \n  temperature: 0.8,\n  max_tokens: 2000\n}) }}",
+        "options": {}
+      },
+      "id": "b3f1c2bc-2030-4fc1-82b1-908313733ee2",
+      "name": "OpenRouter — GitHub Metadata + LinkedIn",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-3568, -2720],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "const response = $input.first().json;\nconst original = $('Prepare README Prompt1').first().json;\n\nlet readme = response.choices?.[0]?.message?.content || '';\n\n// Strip code fences if Gemini/OpenRouter adds them\nreadme = readme.replace(/^```(?:markdown|md)?\\n?/, '').replace(/\\n?```$/, '').trim();\n\nif (!readme) {\n  readme = `# ${original.project_name}\\n\\n> README generation failed. Please write this manually.\\n`;\n}\n\nreturn {\n  ...original,\n  readme_content: readme\n};"
+      },
+      "id": "ec013f56-96ca-47cf-bc2e-448418ba94fe",
+      "name": "Parse README",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-3936, -2720]
+    },
+    {
+      "parameters": {
+        "jsCode": "const response = $input.first().json;\nconst original = $('Prepare GitHub + LinkedIn Prompt1').first().json;\n\nconst raw = response.choices?.[0]?.message?.content || '{}';\nlet metadata;\n\ntry {\n  const cleaned = raw\n    .replace(/^```json\\n?/, '')\n    .replace(/\\n?```$/, '')\n    .trim();\n  \n  const jsonMatch = cleaned.match(/\\{[\\s\\S]*\\}/);\n  metadata = JSON.parse(jsonMatch ? jsonMatch[0] : cleaned);\n\n} catch(e) {\n  // Parse fail hua — raw text se linkedin_post manually extract karo\n  metadata = {\n    repo_description: (original.gemini_analysis?.summary || original.short_description || original.project_name).slice(0, 350),\n    topics: ['python', original.detection?.framework?.toLowerCase() || 'streamlit', 'automation', 'ai', 'n8n'].filter(Boolean),\n    linkedin_post: raw.length > 100 ? raw : `Project: ${original.project_name}\\n\\nCheck it out on GitHub!`\n  };\n}\n\n// Topics sanitize\nmetadata.topics = (metadata.topics || [])\n  .map(t => String(t).toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, ''))\n  .filter(t => t.length > 0 && t.length <= 50)\n  .slice(0, 20);\n\n// linkedin_post verify — agar bahut chota hai toh warn karo\nif (!metadata.linkedin_post || metadata.linkedin_post.length < 100) {\n  console.log('WARNING: linkedin_post too short:', metadata.linkedin_post);\n  console.log('Raw model response:', raw.slice(0, 500));\n}\n\nreturn {\n  ...original,\n  github_metadata: metadata,\n  debug_raw_response: raw.slice(0, 300)\n};"
+      },
+      "id": "616c666b-969a-437c-9262-ea078437d474",
+      "name": "Parse GitHub Metadata",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-3392, -2720]
+    },
+    {
+      "parameters": {
+        "formTitle": "AI Project Release Agent",
+        "formDescription": "Upload your project files to securely sanitize, document and publish your project.\n\n📁 HOW TO UPLOAD MULTIPLE FILES:\n• Option 1: Select all files at once using Ctrl+Click (Windows) or Cmd+Click (Mac)\n• Option 2: ZIP your entire project folder and upload the ZIP file",
+        "formFields": {
+          "values": [
+            { "fieldLabel": "Project Name", "requiredField": true },
+            { "fieldLabel": "Project Files", "fieldType": "file", "requiredField": true },
+            { "fieldLabel": "GitHub Visibility", "fieldType": "dropdown", "fieldOptions": { "values": [ { "option": "public" }, { "option": "private" } ] }, "requiredField": true },
+            { "fieldLabel": "LinkedIn Tone", "fieldType": "dropdown", "fieldOptions": { "values": [ { "option": "Professional" }, { "option": "Casual" }, { "option": "Technical" } ] } },
+            { "fieldLabel": "Email", "fieldType": "email", "requiredField": true }
+          ]
+        },
+        "options": {}
+      },
+      "id": "5d4d3832-df4c-4d6f-bcc9-0c431904eb5b",
+      "name": "Form Trigger",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.2,
+      "position": [-5120, -2992],
+      "webhookId": "578339f7-18cf-4f25-ad09-a8f0af2b9f4b"
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $input.first();\nconst form = input.json || {};\nconst binary = input.binary || {};\n\nconst IGNORED = [\n  'node_modules/', '.git/', '__pycache__/',\n  '.venv/', 'venv/', '.pyc', '.pyo', 'Thumbs.db', '.DS_Store', '__MACOSX/'\n];\n\nconst BINARY_EXT = ['png','jpg','jpeg','gif','svg','ico','pdf','exe','dll','so','whl','bin','dat'];\nconst TEXT_EXT = [\n  'py','js','ts','jsx','tsx','html','css','json','yaml','yml',\n  'md','txt','env','sh','bat','cfg','ini','toml','xml','csv',\n  'sql','r','rb','php','java','cpp','c','h','go','rs','swift',\n  'kt','scala','lua','pl','ps1','gitignore','example','lock',\n  'dockerfile','prettierrc','eslintrc','babelrc'\n];\n\nconst files = [];\nconst seenFiles = new Set();\nconst BINARY_KEYS = Object.keys(binary);\n\nfor (let i = 0; i < BINARY_KEYS.length; i++) {\n  const key = BINARY_KEYS[i];\n  const singleFile = binary[key];\n  if (!singleFile || !singleFile.fileName) continue;\n\n  const filename = singleFile.fileName.replace(/\\\\/g, '/');\n  if (IGNORED.some(p => filename.includes(p))) continue;\n  if (seenFiles.has(filename)) continue;\n  seenFiles.add(filename);\n\n  const ext = filename.includes('.') ? filename.split('.').pop().toLowerCase() : '';\n  const mimeType = singleFile.mimeType || '';\n  const isForcedBinary = BINARY_EXT.includes(ext);\n  const isZip = ext === 'zip';\n\n  let content = '';\n  let isBinary = isForcedBinary;\n\n  if (!isZip && !isForcedBinary) {\n    try {\n      // itemIndex 0 use karo — form trigger pe sirf ek item hota hai\n      const buffer = await this.helpers.getBinaryDataBuffer(0, key);\n      const text = buffer.toString('utf8');\n\n      if (text.includes('\\u0000')) {\n        isBinary = true;\n        content = '[binary file]';\n      } else {\n        content = text;\n      }\n    } catch(e) {\n      isBinary = true;\n      content = '[binary file]';\n    }\n  }\n\n  files.push({\n    filename,\n    content: isBinary ? '[binary file]' : content,\n    extension: ext,\n    binary: isBinary,\n    is_zip: isZip,\n    is_env_file: filename === '.env' || filename.endsWith('/.env')\n  });\n}\n\nif (!files.length) {\n  throw new Error('No files received. Keys: ' + JSON.stringify(BINARY_KEYS));\n}\n\nreturn {\n  project_name: (form['Project Name'] || 'untitled-project').trim(),\n  github_visibility: (form['GitHub Visibility'] || 'public').toLowerCase(),\n  linkedin_tone: form['LinkedIn Tone'] || 'Professional',\n  user_email: (form['Email'] || '').trim().toLowerCase(),\n  short_description: (form['Short Description'] || '').trim(),\n  files,\n  file_names: files.map(f => f.filename),\n  file_count: files.length,\n  has_zip: files.some(f => f.is_zip)\n};"
+      },
+      "id": "916e1c16-aa57-4973-83f1-ddada344f857",
+      "name": "File Intake",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-4928, -2992]
+    }
+  ],
+  "connections": {
+    "Project Detection1": { "main": [[{ "node": "Pass 1 — Secret Scan1", "type": "main", "index": 0 }]] },
+    "Pass 1 — Secret Scan1": { "main": [[{ "node": "Prepare AI Security Review1", "type": "main", "index": 0 }]] },
+    "Prepare AI Security Review1": { "main": [[{ "node": "Groq — Project Analysis + Security", "type": "main", "index": 0 }]] },
+    "Pass 2 — Verification Scan1": { "main": [[{ "node": "Security Gate1", "type": "main", "index": 0 }]] },
+    "Security Gate1": {
+      "main": [
+        [{ "node": "Is n8n Workflow?1", "type": "main", "index": 0 }],
+        [{ "node": "Security Block — Email Alert1", "type": "main", "index": 0 }]
+      ]
+    },
+    "Is n8n Workflow?1": {
+      "main": [
+        [{ "node": "n8n JSON Deep Sanitization1", "type": "main", "index": 0 }],
+        [{ "node": "Take App Screenshot", "type": "main", "index": 0 }]
+      ]
+    },
+    "n8n JSON Deep Sanitization1": { "main": [[{ "node": "Generate Workflow Diagram1", "type": "main", "index": 0 }]] },
+    "Generate Workflow Diagram1": { "main": [[{ "node": "Prepare README Prompt1", "type": "main", "index": 0 }]] },
+    "Prepare README Prompt1": { "main": [[{ "node": "OpenRouter — README Generation", "type": "main", "index": 0 }]] },
+    "Prepare GitHub + LinkedIn Prompt1": { "main": [[{ "node": "OpenRouter — GitHub Metadata + LinkedIn", "type": "main", "index": 0 }]] },
+    "Create GitHub Repo + Push Files1": { "main": [[{ "node": "GitHub — Create Repo", "type": "main", "index": 0 }]] },
+    "LinkedIn Approval Email1": { "main": [[{ "node": "Wait for Approval1", "type": "main", "index": 0 }]] },
+    "Take App Screenshot": { "main": [[{ "node": "Attach Screenshot", "type": "main", "index": 0 }]] },
+    "Attach Screenshot": { "main": [[{ "node": "Prepare README Prompt1", "type": "main", "index": 0 }]] },
+    "Sanitization": { "main": [[{ "node": "Pass 2 — Verification Scan1", "type": "main", "index": 0 }]] },
+    "Groq — Project Analysis + Security": { "main": [[{ "node": "Sanitization", "type": "main", "index": 0 }]] },
+    "GitHub — Create Repo": { "main": [[{ "node": "GitHub — Prepare Uploads", "type": "main", "index": 0 }]] },
+    "GitHub — Prepare Uploads": { "main": [[{ "node": "GitHub — Upload + Next", "type": "main", "index": 0 }]] },
+    "GitHub — All Files Done?": {
+      "main": [
+        [{ "node": "LinkedIn Approval Email1", "type": "main", "index": 0 }],
+        [{ "node": "GitHub — Upload + Next", "type": "main", "index": 0 }]
+      ]
+    },
+    "GitHub — Upload + Next": { "main": [[{ "node": "GitHub — All Files Done?", "type": "main", "index": 0 }]] },
+    "Wait for Approval1": { "main": [[{ "node": "Approved?", "type": "main", "index": 0 }]] },
+    "Approved?": {
+      "main": [
+        [{ "node": "Restore Project Data", "type": "main", "index": 0 }],
+        [{ "node": "LinkedIn Rejected", "type": "main", "index": 0 }]
+      ]
+    },
+    "Publish LinkedIn": { "main": [[{ "node": "Normalize LinkedIn Result1", "type": "main", "index": 0 }]] },
+    "LinkedIn Rejected": { "main": [[{ "node": "Log Rejection to Sheets", "type": "main", "index": 0 }]] },
+    "Normalize LinkedIn Result1": { "main": [[{ "node": "Log to Google Sheets", "type": "main", "index": 0 }]] },
+    "Log to Google Sheets": { "main": [[{ "node": "Send Summary Email1", "type": "main", "index": 0 }]] },
+    "Log Rejection to Sheets": { "main": [[{ "node": "Send Summary Email1", "type": "main", "index": 0 }]] },
+    "Restore Project Data": { "main": [[{ "node": "Register Image Upload", "type": "main", "index": 0 }]] },
+    "Register Image Upload": { "main": [[{ "node": "Prepare Image Binary", "type": "main", "index": 0 }]] },
+    "Prepare Image Binary": { "main": [[{ "node": "Upload Image Binary", "type": "main", "index": 0 }]] },
+    "Upload Image Binary": { "main": [[{ "node": "Publish LinkedIn", "type": "main", "index": 0 }]] },
+    "OpenRouter — README Generation": { "main": [[{ "node": "Parse README", "type": "main", "index": 0 }]] },
+    "OpenRouter — GitHub Metadata + LinkedIn": { "main": [[{ "node": "Parse GitHub Metadata", "type": "main", "index": 0 }]] },
+    "Parse README": { "main": [[{ "node": "Prepare GitHub + LinkedIn Prompt1", "type": "main", "index": 0 }]] },
+    "Parse GitHub Metadata": { "main": [[{ "node": "Create GitHub Repo + Push Files1", "type": "main", "index": 0 }]] },
+    "Form Trigger": { "main": [[{ "node": "File Intake", "type": "main", "index": 0 }]] },
+    "File Intake": { "main": [[{ "node": "Project Detection1", "type": "main", "index": 0 }]] }
+  },
+  "pinData": {},
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "YOUR_INSTANCE_ID_HERE"
+  }
+}

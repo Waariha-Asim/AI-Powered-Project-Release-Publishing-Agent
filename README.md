@@ -1,6 +1,6 @@
 # 🚀 AI-Powered Project Release & Publishing Agent
 
-> An end-to-end n8n automation that takes raw project files, scans and sanitizes secrets, generates documentation, and publishes the project to GitHub and LinkedIn — fully autonomously.
+An end-to-end n8n automation that takes raw project files, scans and sanitizes secrets, generates documentation, and publishes the project to GitHub and LinkedIn — fully autonomously.
 
 ![Screenshot](https://raw.githubusercontent.com/Waariha-Asim/AI-Powered-Project-Release-Publishing-Agent/main/Screenshot%202026-10-09%20224619.png)
 

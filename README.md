@@ -2,6 +2,7 @@
 
 > An end-to-end AI-powered agent built in n8n that takes raw project files, scans and sanitizes secrets, generates documentation, and publishes the project to GitHub and LinkedIn — fully autonomously.
 
+
 ![Screenshot](https://raw.githubusercontent.com/Waariha-Asim/AI-Powered-Project-Release-Publishing-Agent/main/Screenshot%202026-10-09%20224619.png)
 
 ---
